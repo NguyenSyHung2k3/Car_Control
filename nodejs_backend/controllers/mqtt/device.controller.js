@@ -1,98 +1,89 @@
-const {
-    publishConnectToDeviceService,
-    publishLedOnToDeviceService,
-    publishLedOffToDeviceService,
-} = require("../../services/mqtt/device/device.service");
+const deviceService = require("../../services/mqtt/device/device.service");
 
-async function publishConnectToDevice(req, res) {
-    const {
-        userId,
-        deviceId
-    } = req.body;
+/**
+ * Connect to IoT device following MQTT flow
+ * 1. Device publishes status to "iot/{deviceId}/status"
+ * 2. Server subscribes and responds to "iot/{deviceId}/connected"
+ * 3. Device confirms to "iot/{userId}/{deviceId}/status"
+ * 4. Server subscribes to command topics
+ */
+async function connectToDevice(req, res) {
+    const { userId, deviceId } = req.body;
 
-    if(!userId || !deviceId) {
+    // Validate required fields
+    if (!userId || !deviceId) {
         return res.status(400).json({
+            success: false,
             error: "UserId and DeviceId are required!"
-        })
+        });
     }
 
     try {
-        const result = await publishConnectToDeviceService(userId, deviceId);
+        console.log(`[CONNECT] Attempting to connect device ${deviceId} for user ${userId}`);
+        
+        const result = await deviceService.connectToDevice(userId, deviceId);
+        
         if (result === "OK") {
-        return res.json({
-            message: "Device connected successfully!",
-            status: "Connected",
-            deviceId,
-            userId
-        });
-    }
+            return res.json({
+                success: true,
+                message: "Device connected successfully!",
+                data: {
+                    deviceId,
+                    userId,
+                    status: "Connected",
+                    timestamp: new Date().toISOString()
+                }
+            });
+        } else {
+            return res.status(500).json({
+                success: false,
+                error: "Connection failed - unknown response"
+            });
+        }
     } catch (err) {
+        console.error(`[CONNECT ERROR] ${err.message}`);
         return res.status(500).json({
+            success: false,
             error: err.message || "Failed to connect to device"
-        });
-    }
-} 
-
-async function publishLedOnToDevice(req, res) {
-    const {
-        userId,
-        deviceId
-    } = req.body;
-
-    if(!userId || !deviceId) {
-        return res.status(400).json({
-            error: "UserId and DeviceId are required!"
-        })
-    }
-
-    try {
-        const result = await publishLedOnToDeviceService(userId, deviceId, 5000);
-        if (result === "Device LED_ON OK") {
-        return res.json({
-            message: "Turn LED on successfully!",
-            status: "Successful",
-            deviceId,
-            userId
-        });
-    }
-    } catch (err) {
-        return res.status(500).json({
-            error: err.message || "Failed to turn LED on"
         });
     }
 }
 
-async function publishLedOffToDevice(req, res) {
-    const {
-        userId,
-        deviceId
-    } = req.body;
+/**
+ * Get device connection status
+ */
+async function getDeviceStatus(req, res) {
+    const { userId, deviceId } = req.params;
 
-    if(!userId || !deviceId) {
+    if (!userId || !deviceId) {
         return res.status(400).json({
+            success: false,
             error: "UserId and DeviceId are required!"
-        })
+        });
     }
 
     try {
-        const result = await publishLedOffToDeviceService(userId, deviceId, 5000);
-        if (result === "Device LED_OFF OK") {
+        const status = await deviceService.getDeviceStatus(userId, deviceId);
+        
         return res.json({
-            message: "Turn LED off successfully!",
-            status: "Successful",
-            deviceId,
-            userId
+            success: true,
+            data: {
+                deviceId,
+                userId,
+                status: status || "Unknown",
+                lastChecked: new Date().toISOString()
+            }
         });
-    }
     } catch (err) {
+        console.error(`[STATUS ERROR] ${err.message}`);
         return res.status(500).json({
-            error: err.message || "Failed to turn LED off"
+            success: false,
+            error: err.message || "Failed to get device status"
         });
     }
 }
 
 module.exports = {
-    publishConnectToDevice,
-    publishLedOnToDevice,
-    publishLedOffToDevice
-}
+    connectToDevice,
+    getDeviceStatus
+};

@@ -1,203 +1,157 @@
 const Device = require("../../../models/device.model");
 const User = require("../../../models/user.model");
-const Session = require("../../../models/session.device.model");
 const mqttService = require("../../../config/mqtt");
 
-function handleDeviceStatus(userId, deviceId, startPublishing) {
-  return function (topic, message) {
-    if (topic !== `iot/${deviceId}/status`) return;
+/**
+ * Connect to device following MQTT flow
+ * @param {string} userId - User ID
+ * @param {string} deviceId - Device ID
+ * @param {number} timeout - Connection timeout in milliseconds
+ * @returns {Promise<string>} - "OK" on success
+ */
+async function connectToDevice(userId, deviceId, timeout = 10000) {
+    return new Promise((resolve, reject) => {
+        console.log(`[MQTT SERVICE] Starting connection process for device ${deviceId}`);
+        
+        // Subscribe to device status topic
+        mqttService.subscribe(`iot/${deviceId}/status`);
+        
+        let intervalId = null;
+        let timeoutId = null;
+        let isConnected = false;
 
-    let data;
-    try {
-      data = JSON.parse(message);
-    } catch {
-      console.error("Invalid JSON from device:", message);
-      return;
-    }
+        const cleanup = () => {
+            if (intervalId) clearInterval(intervalId);
+            if (timeoutId) clearTimeout(timeoutId);
+            mqttService.removeAllListeners("message");
+            mqttService.unsubscribe(`iot/${deviceId}/status`);
+            mqttService.unsubscribe(`iot/${userId}/${deviceId}/status`);
+            console.log("[MQTT SERVICE] Cleanup completed");
+        };
 
-    console.log("[STEP1] Device responded:", data);
+        const stopPublishing = () => {
+            cleanup();
+            if (!isConnected) {
+                reject(new Error("Connection timeout"));
+            }
+        };
 
-    mqttService.subscribe(`iot/${userId}/${deviceId}/status`);
-    startPublishing();
-  };
-}
+        // Unified message handler for both device status and user-device status
+        const messageHandler = async (topic, message) => {
+            // Handle device status response
+            if (topic === `iot/${deviceId}/status`) {
+                let data;
+                try {
+                    data = JSON.parse(message);
+                } catch (err) {
+                    console.error("[MQTT SERVICE] Invalid JSON from device:", message);
+                    return;
+                }
 
-function handleUserDeviceStatus(userId, deviceId, stopPublishing, resolve, reject) {
-  return async function (topic, message) {
-    if (topic !== `iot/${userId}/${deviceId}/status`) return;
+                console.log(`[MQTT SERVICE] Device ${deviceId} responded with status:`, data);
 
-    let resp;
-    try {
-      resp = JSON.parse(message);
-    } catch {
-      console.error("Invalid JSON from device:", message);
-      return;
-    }
+                if (data.status === "Connected") {
+                    // Subscribe to user-device status topic
+                    mqttService.subscribe(`iot/${userId}/${deviceId}/status`);
+                    console.log(`[MQTT SERVICE] Subscribed to iot/${userId}/${deviceId}/status`);
+                    
+                    // Start publishing connection confirmation
+                    intervalId = setInterval(() => {
+                        const payload = JSON.stringify({ 
+                            userId, 
+                            deviceId, 
+                            msg: "Connected" 
+                        });
+                        mqttService.publish(`iot/${deviceId}/connected`, payload);
+                        console.log(`[MQTT SERVICE] Published connection confirmation: ${payload}`);
+                    }, 1000);
+                }
+            }
+            
+            // Handle user-device status confirmation
+            else if (topic === `iot/${userId}/${deviceId}/status`) {
+                let response;
+                try {
+                    response = JSON.parse(message);
+                } catch (err) {
+                    console.error("[MQTT SERVICE] Invalid JSON from device:", message);
+                    return;
+                }
 
-    if (resp.status === "OK") {
-      console.log("[STEP3] Device accepted");
+                console.log(`[MQTT SERVICE] Device ${deviceId} confirmed connection for user ${userId}:`, response);
 
-      try {
-        let device = await Device.findOne({ deviceId });
+                if (response.status === "OK") {
+                    try {
+                        // Update or create device record in database
+                        let device = await Device.findOne({ deviceId });
+                        
+                        if (!device) {
+                            device = new Device({
+                                deviceId,
+                                owner: userId,
+                                status: "Connected",
+                                lastConnected: new Date()
+                            });
+                            console.log(`[MQTT SERVICE] Created new device record for ${deviceId}`);
+                        } else {
+                            device.owner = userId;
+                            device.status = "Connected";
+                            device.lastConnected = new Date();
+                            console.log(`[MQTT SERVICE] Updated existing device record for ${deviceId}`);
+                        }
+                        
+                        await device.save();
+                        isConnected = true;
+                        cleanup();
+                        resolve("OK");
+                        
+                    } catch (dbError) {
+                        console.error("[MQTT SERVICE] Database error:", dbError.message);
+                        cleanup();
+                        reject(new Error(`Database error: ${dbError.message}`));
+                    }
+                } else {
+                    console.error(`[MQTT SERVICE] Device ${deviceId} rejected connection`);
+                    cleanup();
+                    reject(new Error("Device rejected connection"));
+                }
+            }
+        };
 
-        if (!device) {
-          device = new Device({
-            deviceId,
-            owner: userId,
-            status: "Connected",
-          });
-          await device.save();
-        } else {
-          device.owner = userId;
-          device.status = "Connected";
-          await device.save();
-        }
+        // Set up message handler
+        mqttService.on("message", messageHandler);
 
-        stopPublishing();
-        resolve("OK");
-      } catch (err) {
-        console.error("[DB ERROR]", err.message);
-        stopPublishing();
-        reject(err);
-      }
-    } else {
-      console.error("Device rejected");
-      stopPublishing();
-      reject(new Error("Rejected"));
-    }
-  };
-}
-
-async function publishConnectToDeviceService(userId, deviceId, timeout = 10000) {
-  return new Promise((resolve, reject) => {
-    mqttService.subscribe(`iot/${deviceId}/status`);
-
-    let intervalId = null;
-    let timeoutId = null;
-
-    const stopPublishing = () => {
-      if (intervalId) clearInterval(intervalId);
-      if (timeoutId) clearTimeout(timeoutId);
-
-      mqttService.removeAllListeners("message");
-      mqttService.unsubscribe(`iot/${deviceId}/status`);
-      mqttService.unsubscribe(`iot/${userId}/${deviceId}/status`);
-
-      console.log("[CLEANUP] Stopped publishing and unsubscribed listeners");
-    };
-
-    const deviceStatusHandler = handleDeviceStatus(userId, deviceId, () => {
-      intervalId = setInterval(() => {
-        const payload = JSON.stringify({ userId, deviceId, message: "Connected" });
-        mqttService.publish(`iot/${deviceId}/connected`, payload);
-        console.log(`[STEP2] Published: ${payload}`);
-      }, 1000);
-
-      mqttService.on("message", userDeviceHandler);
+        // Set timeout
+        timeoutId = setTimeout(() => {
+            console.error(`[MQTT SERVICE] Connection timeout for device ${deviceId}`);
+            cleanup();
+            reject(new Error("Connection timeout"));
+        }, timeout);
     });
-
-    const userDeviceHandler = handleUserDeviceStatus(
-      userId,
-      deviceId,
-      stopPublishing,
-      resolve,
-      reject
-    );
-
-    mqttService.on("message", deviceStatusHandler);
-
-    // Timeout
-    timeoutId = setTimeout(() => {
-      console.error("Timeout waiting for device status");
-      stopPublishing();
-      reject(new Error("Timeout"));
-    }, timeout);
-  });
 }
 
-function createCommandHandler(userId, deviceId, command, resolve, reject, stopPublishing) {
-  return async function (topic, message) {
-    if (topic !== `iot/${userId}/${deviceId}/response`) return;
-
-    let resp;
+/**
+ * Get device status from database
+ * @param {string} userId - User ID
+ * @param {string} deviceId - Device ID
+ * @returns {Promise<string>} - Device status
+ */
+async function getDeviceStatus(userId, deviceId) {
     try {
-      resp = JSON.parse(message);
-    } catch {
-      console.error("Invalid JSON from device:", message);
-      return;
+        const device = await Device.findOne({ deviceId, owner: userId });
+        
+        if (!device) {
+            return "Not Found";
+        }
+        
+        return device.status || "Unknown";
+    } catch (err) {
+        console.error("[MQTT SERVICE] Error getting device status:", err.message);
+        throw new Error("Failed to get device status");
     }
-
-    if (resp.status === "OK") {
-      console.log(`[STEP3] Device confirmed ${command}`);
-
-      const device = Device.findById(deviceId);
-      const user = User.findById(userId);
-
-      // const session = new Session({
-      //   device: device,
-      //   user: user,
-      //   command: command,
-      //   status: resp.status,
-      // })
-
-      // await session.save();
-
-      stopPublishing();
-      resolve(`Device ${command} OK`);
-    } else {
-      console.error(`[ERROR] Device failed to ${command}`);
-      stopPublishing();
-      reject(new Error(`Device failed to ${command}`));
-    }
-  };
 }
 
-async function sendDeviceCommand(userId, deviceId, command, timeout = 5000) {
-  return new Promise((resolve, reject) => {
-    mqttService.subscribe(`iot/${userId}/${deviceId}/response`);
-
-    let intervalId = null;
-    let timeoutId = null;
-
-    const stopPublishing = () => {
-      if (intervalId) clearInterval(intervalId);
-      if (timeoutId) clearTimeout(timeoutId);
-
-      mqttService.removeAllListeners("message");
-      mqttService.unsubscribe(`iot/${userId}/${deviceId}/response`);
-      console.log("[CLEANUP] Stopped publishing and unsubscribed listeners");
-    };
-
-    const handler = createCommandHandler(userId, deviceId, command, resolve, reject, stopPublishing);
-
-    mqttService.on("message", handler);
-
-    // 
-    intervalId = setInterval(() => {
-      const payload = JSON.stringify({ userId, deviceId, command });
-      mqttService.publish(`iot/${userId}/${deviceId}/command`, payload);
-      console.log(`[STEP2] Sent command: ${payload}`);
-    }, 1000);
-
-    // Timeout
-    timeoutId = setTimeout(() => {
-      console.error(`Timeout waiting for ${command} response`);
-      stopPublishing();
-      reject(new Error(`Timeout waiting for ${command}`));
-    }, timeout);
-  });
-}
-
-async function publishLedOnToDeviceService(userId, deviceId, timeout = 5000) {
-  return sendDeviceCommand(userId, deviceId, "LED_ON", timeout);
-}
-
-async function publishLedOffToDeviceService(userId, deviceId, timeout = 5000) {
-  return sendDeviceCommand(userId, deviceId, "LED_OFF", timeout);
-}
-
-module.exports = { 
-  publishConnectToDeviceService,
-  publishLedOnToDeviceService,
-  publishLedOffToDeviceService
+module.exports = {
+    connectToDevice,
+    getDeviceStatus
 };
